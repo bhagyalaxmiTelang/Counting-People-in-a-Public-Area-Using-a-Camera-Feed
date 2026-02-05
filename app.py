@@ -1,125 +1,207 @@
-import streamlit as st
-import cv2
-from ultralytics import YOLO
+"""
+JWT-Based Authentication System
+Complete implementation with token generation, refresh, and verification
+"""
 
-# ---------------- PAGE CONFIG ----------------
-st.set_page_config(
-    page_title="Overcrowd Detection System",
-    layout="wide"
-)
+from flask import Flask, request, jsonify
+from functools import wraps
+import jwt
+import datetime
+import sqlite3
+from werkzeug.security import generate_password_hash, check_password_hash
 
-# ---------------- CUSTOM DARK UI ----------------
-st.markdown("""
-<style>
-.stApp { background-color:black; }
-[data-testid="stSidebar"] {
-    background-color: #0f172a;
-    width: 350px !important;
-}
-[data-testid="stSidebar"] * {
-    color: white;
-    font-size: 16px;
-}
-.stButton > button {
-    background: linear-gradient(90deg, #2563eb, #1e40af);
-    color: white;
-    font-size: 18px;
-    padding: 12px;
-    border-radius: 12px;
-    width: 100%;
-}
-.stAlert {
-    border-radius: 12px;
-    font-size: 18px;
-}
-img { border-radius: 15px; }
-</style>
-""", unsafe_allow_html=True)
+app = Flask(__name__)
+app.config['SECRET_KEY'] = 'your-secret-key-change-this-in-production'
+app.config['JWT_ALGORITHM'] = 'HS256'
+app.config['JWT_ACCESS_TOKEN_EXPIRES'] = 3600       # 1 hour
+app.config['JWT_REFRESH_TOKEN_EXPIRES'] = 2592000   # 30 days
 
-# ---------------- TITLE ----------------
-st.markdown("""
-<h1 style='text-align:center;color:#38bdf8;font-size:48px;'>
-🚨 OVERCROWD DETECTION 
-</h1>
-<p style='text-align:center;color:white;font-size:20px;'>
-Smart real-time crowd monitoring using YOLOv8
-</p>
-""", unsafe_allow_html=True)
+# ==================== DATABASE ====================
+class AuthDatabase:
+    def __init__(self, db_path='auth.db'):
+        self.db_path = db_path
+        self.init_database()
 
-# ---------------- SIDEBAR ----------------
-st.sidebar.markdown("<h2 style='text-align:center;'>🎛 CONTROL PANEL</h2>", unsafe_allow_html=True)
+    def init_database(self):
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
 
-max_people = st.sidebar.slider("👥 Allowed Crowd Limit", 1, 200, 25)
-start_btn = st.sidebar.button("▶ START CROWD ANALYSIS")
-
-# ---------------- LOAD MODEL ----------------
-@st.cache_resource
-def load_model():
-    return YOLO("yolov8n.pt")
-
-model = load_model()
-
-VIDEO_PATH = "crowd_video.mp4"
-
-video_area = st.empty()
-status_area = st.empty()
-
-# ---------------- MAIN LOGIC ----------------
-if start_btn:
-
-    cap = cv2.VideoCapture(VIDEO_PATH)
-
-    if not cap.isOpened():
-        st.error("❌ Video file not found")
-    else:
-        status_area.success("✅ Video loaded successfully")
-
-        while cap.isOpened():
-            ret, frame = cap.read()
-            if not ret:
-                break
-
-            # ✅ Resize video (IMPORTANT FIX)
-            frame = cv2.resize(frame, (960, 540))
-
-            results = model(frame, conf=0.30, classes=[0])
-            boxes = results[0].boxes
-            people_count = len(boxes)
-
-            for i, box in enumerate(boxes):
-                x1, y1, x2, y2 = map(int, box.xyxy[0])
-                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                cv2.putText(
-                    frame, f"Person {i+1}",
-                    (x1, y1 - 8),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.6, (0, 255, 0), 2
-                )
-
-            if people_count > max_people:
-                status_area.error(f"🚨 OVERCROWD ALERT: {people_count}/{max_people}")
-                cv2.rectangle(frame, (0, 0), (frame.shape[1], 55), (0, 0, 255), -1)
-                cv2.putText(
-                    frame, "OVERCROWDING DETECTED!",
-                    (25, 38),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    1, (255, 255, 255), 3
-                )
-            else:
-                status_area.success(f"✅ Crowd Normal ({people_count}/{max_people})")
-
-            cv2.putText(
-                frame, f"Total People: {people_count}",
-                (20, frame.shape[0] - 20),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.9, (255, 255, 0), 2
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL,
+                email TEXT UNIQUE NOT NULL,
+                role TEXT DEFAULT 'user',
+                is_active INTEGER DEFAULT 1,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                last_login DATETIME,
+                failed_attempts INTEGER DEFAULT 0,
+                locked_until DATETIME
             )
+        ''')
 
-            # ✅ Convert BGR → RGB for Streamlit
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS refresh_tokens (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                token TEXT UNIQUE NOT NULL,
+                expires_at DATETIME NOT NULL,
+                revoked INTEGER DEFAULT 0
+            )
+        ''')
 
-            # ✅ Proper display
-            video_area.image(frame_rgb, use_column_width=True)
+        conn.commit()
 
-        cap.release()
-        st.info("🎬 Crowd analysis completed")
+        # Create default admin
+        cursor.execute("SELECT * FROM users WHERE username='admin'")
+        if not cursor.fetchone():
+            password_hash = generate_password_hash(
+                'admin123', method='pbkdf2:sha256'
+            )
+            cursor.execute('''
+                INSERT INTO users (username, password_hash, email, role)
+                VALUES (?, ?, ?, ?)
+            ''', ('admin', password_hash, 'admin@example.com', 'admin'))
+            conn.commit()
+            print("✅ Default admin created: admin / admin123")
+
+        conn.close()
+
+    def get_user_by_username(self, username):
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('SELECT * FROM users WHERE username=?', (username,))
+        user = cursor.fetchone()
+        conn.close()
+        return user
+
+    def get_user_by_id(self, user_id):
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('SELECT * FROM users WHERE id=?', (user_id,))
+        user = cursor.fetchone()
+        conn.close()
+        return user
+
+    def create_user(self, username, password, email):
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+
+        password_hash = generate_password_hash(
+            password, method='pbkdf2:sha256'
+        )
+
+        try:
+            cursor.execute('''
+                INSERT INTO users (username, password_hash, email)
+                VALUES (?, ?, ?)
+            ''', (username, password_hash, email))
+            conn.commit()
+            conn.close()
+            return True, "User created successfully"
+        except:
+            conn.close()
+            return False, "Username or email already exists"
+
+    def verify_password(self, username, password):
+        user = self.get_user_by_username(username)
+        if not user:
+            return False, "User not found"
+
+        if check_password_hash(user[2], password):
+            return True, user
+        else:
+            return False, "Invalid password"
+
+# Initialize DB
+auth_db = AuthDatabase()
+
+# ==================== JWT FUNCTIONS ====================
+def generate_access_token(user):
+    payload = {
+        'user_id': user[0],
+        'username': user[1],
+        'role': user[4],
+        'exp': datetime.datetime.utcnow() +
+               datetime.timedelta(seconds=app.config['JWT_ACCESS_TOKEN_EXPIRES']),
+        'type': 'access'
+    }
+    return jwt.encode(payload, app.config['SECRET_KEY'],
+                      algorithm=app.config['JWT_ALGORITHM'])
+
+def generate_refresh_token(user):
+    payload = {
+        'user_id': user[0],
+        'exp': datetime.datetime.utcnow() +
+               datetime.timedelta(seconds=app.config['JWT_REFRESH_TOKEN_EXPIRES']),
+        'type': 'refresh'
+    }
+    return jwt.encode(payload, app.config['SECRET_KEY'],
+                      algorithm=app.config['JWT_ALGORITHM'])
+
+def token_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        token = None
+        if 'Authorization' in request.headers:
+            try:
+                token = request.headers['Authorization'].split()[1]
+            except:
+                return jsonify({'message': 'Invalid token format'}), 401
+
+        if not token:
+            return jsonify({'message': 'Token missing'}), 401
+
+        try:
+            payload = jwt.decode(token, app.config['SECRET_KEY'],
+                                 algorithms=[app.config['JWT_ALGORITHM']])
+            request.current_user = payload
+        except jwt.ExpiredSignatureError:
+            return jsonify({'message': 'Token expired'}), 401
+        except jwt.InvalidTokenError:
+            return jsonify({'message': 'Invalid token'}), 401
+
+        return f(*args, **kwargs)
+    return decorated
+
+# ==================== API ROUTES ====================
+@app.route('/api/auth/register', methods=['POST'])
+def register():
+    data = request.get_json()
+    success, message = auth_db.create_user(
+        data['username'], data['password'], data['email']
+    )
+    return jsonify({'success': success, 'message': message})
+
+@app.route('/api/auth/login', methods=['POST'])
+def login():
+    data = request.get_json()
+    valid, result = auth_db.verify_password(
+        data['username'], data['password']
+    )
+
+    if not valid:
+        return jsonify({'success': False, 'message': result}), 401
+
+    access = generate_access_token(result)
+    refresh = generate_refresh_token(result)
+
+    return jsonify({
+        'success': True,
+        'access_token': access,
+        'refresh_token': refresh
+    })
+
+@app.route('/api/protected', methods=['GET'])
+@token_required
+def protected():
+    return jsonify({
+        'message': 'Protected route accessed',
+        'user': request.current_user
+    })
+
+# ==================== MAIN ====================
+if __name__ == '__main__':
+    print("🔐 JWT Authentication System Running")
+    app.run(debug=True, port=5002)
